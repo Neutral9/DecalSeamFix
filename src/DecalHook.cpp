@@ -12,7 +12,7 @@
 //  3. the land bodies of a cell that comes back into the grid from the cell buffer lose property 1, so the engine
 //     gets no mesh for them -> the property is put back (and, should a call still come without a mesh, the piece
 //     goes to every quadrant the decal reaches that no call of this impact went to);
-//  4. old decals are removed mesh by mesh (cell unloads) -> when one piece goes, the rest of its decal goes too.
+//  4. old decals are removed mesh by mesh (cell unloads) -> when one piece goes, the rest of its decal is hidden.
 namespace DecalHook
 {
     namespace
@@ -53,11 +53,14 @@ namespace DecalHook
         }
 
         // --- 4. a decal's pieces go together ---
+        // The game frees a piece without regard to anyone else's reference to it, so a piece is only ever touched
+        // while its pointer is in a mesh's decal list (the game's own hold on it); otherwise it is only compared.
+        // The rest of a decal whose piece went is hidden, never taken out of the game's lists.
 
         struct Piece
         {
-            RE::NiPointer<RE::BSTempEffect> effect;
-            bool                            built = false;  // seen with its geometry on the mesh
+            const RE::BSTempEffect* effect;  // never dereferenced unless found in a decal list
+            bool                    built = false;  // seen with its geometry on the mesh
         };
         struct Group
         {
@@ -68,24 +71,8 @@ namespace DecalHook
 
         std::mutex        groupLock;
         std::deque<Group> groups;  // newest at the back
-        // pieces we removed, held until nothing of the game refers to them any more
-        std::deque<RE::NiPointer<RE::BSTempEffect>> graveyard;
 
-        // our reference is the only one left: the game has let the piece go
-        bool Gone(const RE::BSTempEffect* a_piece)
-        {
-            return a_piece->GetRefCount() <= 1;
-        }
-
-        // its geometry is built and hangs on a mesh's decal node (a piece on a quadrant the decal does not
-        // reach gets none and is let go at once: that is no removal)
-        bool Built(RE::BSTempEffect* a_piece)
-        {
-            const auto geometry = a_piece->initialized ? a_piece->Get3D() : nullptr;
-            return geometry && geometry->parent;
-        }
-
-        void AddPiece(const RE::NiPoint3& a_origin, RE::BSTempEffect* a_piece)
+        void AddPiece(const RE::NiPoint3& a_origin, const RE::BSTempEffect* a_piece)
         {
             std::scoped_lock lock(groupLock);
             if (groups.empty() || groups.back().origin.GetSquaredDistance(a_origin) >= 1.0f) {
@@ -94,7 +81,7 @@ namespace DecalHook
                     groups.pop_front();
                 }
             }
-            groups.back().pieces.push_back({ RE::NiPointer<RE::BSTempEffect>(a_piece) });
+            groups.back().pieces.push_back({ a_piece });
         }
 
         // loading clears every decal at once: no group may take that for the game removing a piece
@@ -104,38 +91,38 @@ namespace DecalHook
             groups.clear();
         }
 
-        // takes a piece off its mesh: out of the decal node's list, its geometry detached (the game ignores a
-        // lifetime on these decals). The manager's count is the game's: it still tracks the piece and counts it
-        // down itself.
-        void Remove(RE::BSTempEffect* a_piece)
+        // every decal the meshes hold now
+        std::unordered_set<const RE::BSTempEffect*> LivePieces(RE::BGSDecalManager* a_manager)
         {
-            const auto manager = RE::BGSDecalManager::GetSingleton();
-            if (!manager) {
-                return;
-            }
-            const auto geometry = a_piece->Get3D();
-            for (const auto& node : manager->decalNodes) {
-                if (!node) {
-                    continue;
-                }
-                auto&      list = node->GetRuntimeData().decals;
-                const auto it = std::ranges::find_if(list, [&](const auto& a_d) { return a_d.get() == a_piece; });
-                if (it != list.end()) {
-                    list.erase(it);
-                    if (geometry && geometry->parent == node.get()) {
-                        node->DetachChild(geometry);
+            std::unordered_set<const RE::BSTempEffect*> live;
+            for (const auto& node : a_manager->decalNodes) {
+                if (node) {
+                    for (const auto& decal : node->GetRuntimeData().decals) {
+                        if (decal) {
+                            live.insert(decal.get());
+                        }
                     }
-                    return;
                 }
             }
-            if (geometry) {
-                geometry->SetAppCulled(true);  // on no decal node: out of sight at least
-            }
+            return live;
+        }
+
+        // its geometry is built and hangs on the mesh's decal node (a piece on a quadrant the decal does not reach
+        // gets none and is let go at once: that is no removal). Only for a live piece.
+        bool Built(const RE::BSTempEffect* a_piece)
+        {
+            const auto geometry = a_piece->initialized ? a_piece->Get3D() : nullptr;
+            return geometry && geometry->parent;
         }
 
         // on the main thread, a few times a second
         void CheckGroups()
         {
+            const auto manager = RE::BGSDecalManager::GetSingleton();
+            if (!manager) {
+                return;
+            }
+            const auto       live = LivePieces(manager);
             std::scoped_lock lock(groupLock);
             for (auto it = groups.begin(); it != groups.end();) {
                 // a decal on one mesh needs no watching (the newest group may still be growing)
@@ -145,11 +132,11 @@ namespace DecalHook
                 }
                 bool removedBuilt = false;
                 std::erase_if(it->pieces, [&](Piece& a_p) {
-                    if (Gone(a_p.effect.get())) {
+                    if (!live.contains(a_p.effect)) {
                         removedBuilt |= a_p.built;
                         return true;
                     }
-                    a_p.built |= Built(a_p.effect.get());
+                    a_p.built = a_p.built || Built(a_p.effect);
                     return false;
                 });
                 if (!removedBuilt) {
@@ -157,14 +144,11 @@ namespace DecalHook
                     continue;
                 }
                 for (const auto& piece : it->pieces) {
-                    Remove(piece.effect.get());
-                    graveyard.push_back(piece.effect);
+                    if (const auto geometry = piece.effect->Get3D()) {  // live: checked just above
+                        geometry->SetAppCulled(true);
+                    }
                 }
                 it = groups.erase(it);
-            }
-            std::erase_if(graveyard, [](const auto& a_p) { return Gone(a_p.get()); });
-            while (graveyard.size() > kMaxGroups) {
-                graveyard.pop_front();
             }
         }
 
@@ -295,14 +279,15 @@ namespace DecalHook
                     }
                 }
             }
-            if (!body || body->GetProperty(1)) {
-                return false;
-            }
-            const auto shape = LandShape(a_mesh);
+            const auto shape = body ? LandShape(a_mesh) : nullptr;
             if (!shape) {
                 return false;
             }
+            // looked at and changed under the world's lock: the physics runs on other threads
             RE::BSWriteLockGuard lock(a_world->worldLock);
+            if (body->GetProperty(1)) {
+                return false;
+            }
             body->SetProperty(1, RE::hkpPropertyValue(static_cast<void*>(shape)));
             return true;
         }

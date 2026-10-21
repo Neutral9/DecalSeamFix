@@ -7,7 +7,7 @@ In vanilla Skyrim, terrain is split into cells, and each cell into four quadrant
 1. **Pieces dropped near other decals.** When a new decal lands close to an existing one, the engine may silently reject the piece for one quadrant and keep the others. Pieces on terrain are now always placed.
 2. **Pieces lost after loading a save.** The engine assigns every piece to the cell where the hit happened, even when the piece lies on a neighbouring cell's terrain. The save keeps only pieces that belong to the cell they lie on, so after loading, decals near cell borders come back cut in half. Each piece is now assigned to the cell whose terrain it actually lies on, so it is saved and restored correctly.
 3. **Neighbouring terrain not found after walking back.** This is the main cause. When you leave an area and come back, the game reuses recently unloaded cells from its cell buffer. The physics bodies of their terrain come back without the link to their 3D mesh. The engine uses that link to place decal pieces, so decals stop crossing into those cells until you reload the game. The plugin watches cells that come back from the buffer and restores the missing links. If a piece still arrives without a terrain mesh, the plugin places it on the quadrants the decal reaches.
-4. **Old decals removed by halves.** When a cell unloads, the game removes the decal pieces on its terrain but leaves the pieces of the same decal on the neighbouring cell. When the game removes one piece of a decal, the plugin now removes the rest of it too, so decals disappear as a whole.
+4. **Old decals removed by halves.** When a cell unloads, the game removes the decal pieces on its terrain but leaves the pieces of the same decal on the neighbouring cell. When the game removes one piece of a decal, the plugin now hides the rest of it too, so decals disappear as a whole.
 
 ## Requirements
 
@@ -28,7 +28,7 @@ The impact code (Address Library ID 44186) finds the land bodies the decal touch
 
 - A detour on `ApplyDecal` (MinHook) places every terrain piece with `force` set and gives it the cell that owns the mesh.
 - Land bodies of cells that come back into the loaded grid lose property 1 a few seconds after the cell enters the grid, when it is attached again. Such cells are watched for 60 seconds after each entry: a ray per quadrant finds the land body (collision layer 17), and a missing property 1 is set back to the quadrant's `BSTriShape`, under the physics world lock.
-- The pieces of one decal are kept as a group. When the game lets go of one of them, the others are taken off their meshes too.
+- The pieces of one decal are kept as a group. When one of them is gone from its mesh's decal list, the others are hidden. A piece is only touched while the game still holds it in such a list; the plugin never takes anything out of the game's lists.
 
 The log is `Documents/My Games/Skyrim Special Edition/SKSE/DecalSeamFix.log`.
 
